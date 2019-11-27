@@ -13,10 +13,218 @@ import socket
 import telnetlib
 import threading
 import time
+import string
 
 from typing import Any, Callable, Dict, Type
 
 _LOGGER = logging.getLogger(__name__)
+
+class Processor(object):
+  """ Encapsulates the specific communication protocols associated with a Lutron Processor. The base comms protocol is RA2/QS,
+    when talking to an HWI processor, there is a protocol conversion."""
+
+  # Procoessor types. Note QS and RA2 have the same protocol. 
+  QS = 0
+  RA2 = 1
+  HWI = 2
+
+  USER_PROMPT = b'login: '
+  PW_PROMPT = b'password: '
+
+  class CommandFormatter(string.Formatter):
+    """ Helper class to format strings for conversions. Adds to the Formatter spec:
+          - Added a psuedo arg_name 'all'. An arg_name such as {all} will return all the arguments
+          - Added two new conversion specifications: !o and !F.
+             o !o print the object associated with an object id.
+             o !F convert a string to a float. """
+
+    def __init__(self, processor):
+        """ Init, requires an initialized processor"""
+        self._processor = processor
+
+    def get_field(self, field_name, *args, **kwargs):
+        """ A pseudo arg_name {all} that will return all input args. Example:
+            input: "This is the input: {all}".format("a", "b", "c", "d")
+            output: This is the input: a b c d"""
+
+        if field_name == "all":
+            return ((" ".join(args[0]), "all"))
+        else:
+            return super().get_field(field_name, *args, **kwargs)
+
+    def convert_field(self, value, conversion):
+        """ Additional field conversions. !o for object id, and !F for string to float. Example:
+            "The obj: {0!o} from obj_id: {0}".format(obj_id)
+
+            "A real float: {0!F:.2f}.format("123.4567")"""
+
+        if conversion == 'o':
+            return self._processor.obj(value)
+        elif conversion == 'F':
+            return float(value)
+        else:
+            return super().convert_field(value, conversion)
+
+  def __init__(self):
+    """Initialize. This *should* require the processor type upon initialization.
+     With the structure of the existing code that's difficult. So it can initialize
+     without args and then later have the processor type set."""
+
+    self._need_single_login = False              # if login then password or login,password
+    self._processor = self.RA2                   # processor type, see class constants
+    self._cmd_index = 0                          # index into cmd table
+    self._prompt = b'GNET'                       # prompt to look for when logged in
+    self._format = self.CommandFormatter(self)   # internal string formatter
+    self._ids = {}                               # dict of ids to hold id -> obj mappings
+
+      # rewrite rules. matches on the first argument.
+      #
+      #    Input                   QS         HWI
+      #    -----                  ---       ------
+      #    literal               literal     literal
+      #    QS Command String     verbatim    HWI command string
+      #    HWI level change     ~OUPUT cmd   NA
+      #    <all others pass through>
+      #
+    self._cmds = { 'PROMPT'  : [["#MONITORING,12,2"], ["PROMPTOFF"]],
+                   'MON_OFF' : [["#MONITORING,255,2"], ["DLMOFF", "KLMOFF", "KBMOFF", "GSMOFF"]],
+                   'BTN_MON' : [["#MONITORING,3,1"], ["KBMON"]],
+                   'LED_MON' : [["#MONITORING,4,1"], ["KLMON"]],
+                   'ZONE_MON' : [["#MONITORING,5,1"], ["DLMON"]],
+                   'OCCP_MON' : [["#MONITORING,6,1"], []],
+                   'SCENE_MON' : [["#MONITORING,8,1"], []],
+                   '#DEVICE' : [["{all}"], ["KBP, {1}, {2}"]],
+                   '?OUTPUT' : [["{all}"], ["RDL, {1}"]],
+                   '#OUTPUT' : [["{all}"], ["FADEDIM, {3!F:.0f}, 0, 0, {1}"]],
+                   'DL' : [[], ["%sOUTPUT, {1}, %s, {2}" % (Lutron.OP_RESPONSE, Output._ACTION_ZONE_LEVEL)]]
+                    }
+
+  @property
+  def processor_type(self):
+    return self._processor
+
+  def obj(self, obj_id, cmd_type=None):
+      """ return the obj from an id. If the cmd_type isn't passed in, it'll look through all
+      cmd types for the id"""
+      obj_id = obj_id.strip()
+      if cmd_type:
+        return self._ids[cmd_type][obj_id]
+      else:
+        for cmd_dict in self._ids:
+            if obj_id in cmd_dict:
+                return cmd_dict[obj_id]
+
+  @property
+  def need_single_login(self):
+    return self._need_single_login
+
+  @property
+  def prompt(self):
+    return self._prompt
+
+  @property
+  def cmd_types(self):
+     """ return all the cmd_types available"""
+     return self._ids.keys()
+
+  def canonicalize_addr(self, addr):
+    """ Turns a HWI address into the canonical format. i.e., square brackets, colon separated,
+      and two digits.
+      1:2:34 -> [01:02:34]"""
+
+    # if it already has brackets or whitespace, strip it out so that it can be reformatted
+    addr = addr.strip("[]%s" % string.whitespace)
+
+    # this mess turns a HWI address into the canonical format. i.e., 1:2:3 -> [ 01:02:03 ]
+    return "[{}]".format(":".join(["{:02}".format(int(a)) for a in addr.split(':')]))
+
+  def register_id(self, cmd_type, obj):
+    """Handles the management of ids. HWI processors use addresses whereas the newer
+    processors use ids. This abstracts out the differences."""
+    ids = self._ids.setdefault(cmd_type, {})
+
+    if self.processor_type == Processor.HWI:
+      obj_id = self.canonicalize_addr(obj.address)
+    else:
+      obj_id = obj.id
+
+    if obj_id in ids:
+      raise IntegrationIdExistsError
+    self._ids[cmd_type][obj_id] = obj
+    _LOGGER.debug("Registered %s of type %s" % (obj_id, cmd_type))
+
+  def setProcessor(self, processor_type):
+    if processor_type == "HWI":
+      self._processor = self.HWI
+      self._need_single_login = True
+      self._cmd_index = 1
+      self._prompt = b'LNET> '
+    elif processor_type == "QS":
+      self._processor = self.QS
+      self._cmd_index = 0
+      self._prompt = b'QNET> '
+    else:
+      # at this point, set the processor type to RA2 independent of what was passed in
+      _LOGGER.info("Unknown processor \"%s\", defaulting to RA2" % processor_type)
+      self._processor = self.RA2
+      self._cmd_index = 0
+      self._prompt = b'GNET>'
+
+  def cmd(self, command_str):
+    """ Take in a command and translate if needed. The native protocol is QS,
+    so if the command is inHWI format, convert to QS. All commands are returned as
+    a list of one or more commands."""
+
+    # empty strings are often returned from the main loop
+    if command_str == '':
+        return [command_str]
+
+    #
+    # Find the command name for lookup. If there's nothing that looks like a command, deem it
+    # a passthrough and return the original string. All commands need not be implemented in the
+    # _cmds table.
+    #
+
+    # OP_EXECUTE or OP_QUERY commands are translated for HWI
+    if command_str[0] == Lutron.OP_EXECUTE or command_str[0] == Lutron.OP_QUERY:
+        cmd_name = command_str.split(',')[0]
+
+    # Some string literal commands w/ arguments don't start with OP_EXECUTE or OP_QUERY
+    elif command_str.split(",")[0] in self._cmds:
+        cmd_name = command_str.split(",")[0]
+
+    # String literal commands without arguments
+    elif command_str in self._cmds:
+        cmd_name = command_str
+
+    # There's no translation, pass it back as is
+    else:
+        return([command_str])
+
+    # Each native command can turn into one or more translated commands.
+    # The commands returned from the table are format strings to determine how to
+    # handle the args. So, get the command and then format the final string with args.
+    cmd_list = self._cmds[cmd_name][self._cmd_index]
+    cooked_cmds = [self._format.vformat((n), command_str.split(','), {}) for n in cmd_list]
+    try:
+        _LOGGER.debug("Converting cmd %s to %s" % (command_str, cooked_cmds))
+        return cooked_cmds
+    except:
+      return [command_str]
+
+
+  def connect(self, telnet, user, password):
+    """Connect to the processor. HWI requires login,password whereas QA is a normal
+    login followed by password"""
+
+    telnet.read_until(self.USER_PROMPT, timeout=3)
+    if self._need_single_login:
+      login_string="%s,%s".encode('ascii') % (user, password)
+      telnet.write(login_string + b'\r\n')
+    else:
+      telnet.write(user + b'\r\n')
+      telnet.read_until(self.PW_PROMPT, timeout=3)
+      telnet.write(password + b'\r\n')
 
 class LutronException(Exception):
   """Top level module exception."""
@@ -41,9 +249,6 @@ class InvalidSubscription(LutronException):
 
 class LutronConnection(threading.Thread):
   """Encapsulates the connection to the Lutron controller."""
-  USER_PROMPT = b'login: '
-  PW_PROMPT = b'password: '
-  PROMPT = b'GNET> '
 
   def __init__(self, host, user, password, recv_callback):
     """Initializes the lutron connection, doesn't actually connect."""
@@ -58,8 +263,16 @@ class LutronConnection(threading.Thread):
     self._connect_cond = threading.Condition(lock=self._lock)
     self._recv_cb = recv_callback
     self._done = False
+    self._processor = Processor()
 
     self.setDaemon(True)
+
+  @property
+  def processor(self):
+    return self._processor
+
+  def setControllerType(self, processor_type):
+    self._processor.setProcessor(processor_type)
 
   def connect(self):
     """Connects to the lutron controller."""
@@ -79,7 +292,10 @@ class LutronConnection(threading.Thread):
     """
     _LOGGER.debug("Sending: %s" % cmd)
     try:
-      self._telnet.write(cmd.encode('ascii') + b'\r\n')
+      cooked_cmds = self._processor.cmd(cmd)
+      for cooked_cmd in cooked_cmds:
+        _LOGGER.debug("Sending Command: %s -> %s" % (cmd, cooked_cmd))
+        self._telnet.write(cooked_cmd.encode('ascii') + b'\r\n')
     except (BrokenPipeError, TimeoutError, OSError, AttributeError):
       self._disconnect_locked()
 
@@ -97,6 +313,7 @@ class LutronConnection(threading.Thread):
   def _do_login_locked(self):
     """Executes the login procedure (telnet) as well as setting up some
     connection defaults like turning off the prompt, etc."""
+    _LOGGER.info("Logging in over telnet")
     self._telnet = telnetlib.Telnet(self._host, timeout=2)  # 2 second timeout
 
     # Ensure we know that connection goes away somewhat quickly
@@ -104,27 +321,27 @@ class LutronConnection(threading.Thread):
       sock = self._telnet.get_socket()
       sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
       # Send keepalive probes after 60 seconds of inactivity
-      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+#      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
       # Wait 10 seconds for an ACK
-      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+#      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
       # Send 3 probes before we give up
-      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+#     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
     except OSError:
       pass
 
-    self._telnet.read_until(LutronConnection.USER_PROMPT, timeout=3)
-    self._telnet.write(self._user + b'\r\n')
-    self._telnet.read_until(LutronConnection.PW_PROMPT, timeout=3)
-    self._telnet.write(self._password + b'\r\n')
-    self._telnet.read_until(LutronConnection.PROMPT, timeout=3)
+    self._processor.connect(self._telnet, self._user, self._password)
 
-    self._send_locked("#MONITORING,12,2")
-    self._send_locked("#MONITORING,255,2")
-    self._send_locked("#MONITORING,3,1")
-    self._send_locked("#MONITORING,4,1")
-    self._send_locked("#MONITORING,5,1")
-    self._send_locked("#MONITORING,6,1")
-    self._send_locked("#MONITORING,8,1")
+
+    _LOGGER.debug("Logged in, waiting for prompt")
+    self._telnet.read_until(self._processor.prompt, timeout=3)
+
+    self._send_locked("PROMPT")
+    self._send_locked("MON_OFF")
+    self._send_locked("BTN_MON")
+    self._send_locked("LED_MON")
+    self._send_locked("ZONE_MON")
+    self._send_locked("OCCP_MON")
+    self._send_locked("SCENE_MON")
 
   def _disconnect_locked(self):
     """Closes the current connection. Assume self._lock is held."""
@@ -164,12 +381,14 @@ class LutronConnection(threading.Thread):
           raise EOFError('Telnet object already torn down')
       except (EOFError, TimeoutError, socket.timeout, AttributeError):
         try:
+          # if it didn't connect, wait a bit to see if the transient error cleared up.
+          time.sleep(1)
           self._lock.acquire()
           self._disconnect_locked()
           continue
         finally:
           self._lock.release()
-      self._recv_cb(line.decode('ascii').rstrip())
+      self._recv_cb(self._processor.cmd(line.decode('ascii').rstrip())[0])
 
   def run(self):
     """Main entry point into our receive thread.
@@ -193,10 +412,113 @@ class LutronXmlDbParser(object):
 
   def __init__(self, lutron, xml_db_str):
     """Initializes the XML parser, takes the raw XML data as string input."""
+
     self._lutron = lutron
     self._xml_db_str = xml_db_str
     self.areas = []
     self.project_name = None
+
+  def __str__(self):
+    return "%s:\n%s" % (self.project_name, 
+        "\n".join([str(a) for a in self._areas]))
+
+class HWIXmlDbParser(LutronXmlDbParser):
+  """ Parse HWI XML DB's """
+
+  def __init__(self, lutron, xml_db_str):
+    super().__init__(lutron, xml_db_str)
+
+  def parse(self):
+    """Main entrypoint into the parser. It interprets and creates all the
+    relevant Lutron objects and stuffs them into the appropriate hierarchy."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(self._xml_db_str)
+    # The structure is something like this:
+    # <Area>
+    #   <Room ...>
+    #     <Scenes ...>
+    #     <ShadeGroups ...>
+    #     <Outputs ...>
+    #        <Output ...>
+    #     <Areas ...>
+    #       <Area ...>
+
+    self.project_name = root.find('ProjectName').text
+
+    for area_xml in root.getiterator('Area'):
+      self._parse_area(area_xml)
+    return True
+
+  def _parse_area(self, area_xml):
+    """Parses an Area tag, which is effectively a room, depending on how the
+    Lutron controller programming was done."""
+
+    area_name = area_xml.find('Name').text
+    for room_xml in area_xml.getiterator('Room'):
+        area = Area(self._lutron,
+                  name="%s-%s" % (area_name, room_xml.find('Name').text),
+                  integration_id=int(room_xml.find('Id').text),
+                  occupancy_group_id=None)
+
+        outputs = room_xml.find('Outputs')
+        for output_xml in outputs.getiterator('Output'):
+            output = self._parse_output(output_xml)
+            area.add_output(output)
+        self._parse_devices(area, room_xml)
+        self.areas.append(area)
+
+  def _parse_devices(self, area, room_xml):
+    control_stations = room_xml.find('Inputs')
+    for cs_xml in control_stations.getiterator('ControlStation'):
+      devices = cs_xml.find('Devices')
+      for device_xml in devices.getiterator('Device'):
+        keypad = self._parse_keypad(device_xml, cs_xml)
+        area.add_keypad(keypad)
+
+  def _parse_output(self, output_xml):
+    """Parses an output, which is generally a switch controlling a set of
+    lights/outlets, etc."""
+
+    output = Output(self._lutron,
+                    name=output_xml.find('Name').text,
+                    integration_id=output_xml.find('Address').text,
+                    address=output_xml.find('Address').text,
+                    output_type=output_xml.find('Type').text,
+                    watts=int(output_xml.find('FixtureWattage').text))
+    return output
+  def _parse_keypad(self, keypad_xml, cs_xml):
+    """Parses a keypad or dimmer."""
+    keypad = Keypad(self._lutron,
+                    name=cs_xml.find('Name').text,
+                    keypad_type=keypad_xml.find('Type').text,
+                    location=keypad_xml.find('GangPosition').text,
+                    integration_id=keypad_xml.find('Address').text,
+                    address=keypad_xml.find('Address').text)
+
+    buttons = keypad_xml.find('Buttons')
+    for buttons_xml in buttons.getiterator('Button'):
+        button = self._parse_button(keypad, buttons_xml)
+        if button: keypad.add_button(button)
+
+    return keypad
+
+  def _parse_button(self, keypad, button_xml):
+      button_type = button_xml.find('Type').text
+
+      if button_type != 'Not Programmed':
+        button = Button(self._lutron, keypad,
+                        name=button_xml.find('Name').text,
+                        num=int(button_xml.find('Number').text),
+                        button_type=button_xml.find('Type').text,
+                        direction='direction')
+
+        return button
+
+class QSXmlDbParser(LutronXmlDbParser):
+  """ Parse QS/RA2 XML DB's """
+
+  def __init__(self, lutron, xml_db_str):
+    super().__init__(lutron, xml_db_str)
 
   def parse(self):
     """Main entrypoint into the parser. It interprets and creates all the
@@ -337,7 +659,6 @@ class LutronXmlDbParser(object):
                         name=sensor_xml.get('Name'),
                         integration_id=int(sensor_xml.get('IntegrationID')))
 
-
 class Lutron(object):
   """Main Lutron Controller class.
 
@@ -368,6 +689,18 @@ class Lutron(object):
     """Return the areas that were discovered for this Lutron controller."""
     return self._areas
 
+  @property
+  def name(self):
+    """Return the name of the project running on this Lutron controller."""
+    return self._name
+
+  def id_to_obj(self, obj_id, cmd_type=None):
+      return self._conn.processor.obj(obj_id, cmd_type)
+
+  @property
+  def processor_type(self):
+    return self._conn.processor.processor_type
+
   def subscribe(self, obj, handler):
     """Subscribes to status updates of the requested object.
 
@@ -388,10 +721,7 @@ class Lutron(object):
     """Registers an object (through its integration id) to receive update
     notifications. This is the core mechanism how Output and Keypad objects get
     notified when the controller sends status updates."""
-    ids = self._ids.setdefault(cmd_type, {})
-    if obj.id in ids:
-      raise IntegrationIdExistsError
-    self._ids[cmd_type][obj.id] = obj
+    self._conn.processor.register_id(cmd_type, obj)
 
   def _dispatch_legacy_subscriber(self, obj, *args, **kwargs):
     """This dispatches the registered callback for 'obj'. This is only used
@@ -404,6 +734,7 @@ class Lutron(object):
     """Invoked by the connection manager to process incoming data."""
     if line == '':
       return
+    _LOGGER.debug("Received: %s" % line)
     # Only handle query response messages, which are also sent on remote status
     # updates (e.g. user manually pressed a keypad button)
     if line[0] != Lutron.OP_RESPONSE:
@@ -411,16 +742,17 @@ class Lutron(object):
       return
     parts = line[1:].split(',')
     cmd_type = parts[0]
-    integration_id = int(parts[1])
+    integration_id = parts[1]
     args = parts[2:]
-    if cmd_type not in self._ids:
+
+    if cmd_type not in self._conn.processor.cmd_types:
       _LOGGER.info("Unknown cmd %s (%s)" % (cmd_type, line))
       return
-    ids = self._ids[cmd_type]
-    if integration_id not in ids:
+  
+    obj = self.id_to_obj(integration_id, cmd_type)
+    if not obj:
       _LOGGER.warning("Unknown id %d (%s)" % (integration_id, line))
       return
-    obj = ids[integration_id]
     handled = obj.handle_update(args)
 
   def connect(self):
@@ -430,7 +762,7 @@ class Lutron(object):
   def send(self, op, cmd, integration_id, *args):
     """Formats and sends the requested command to the Lutron controller."""
     out_cmd = ",".join(
-        (cmd, str(integration_id)) + tuple((str(x) for x in args)))
+        (cmd, integration_id) + tuple((str(x) for x in args)))
     self._conn.send(op + out_cmd)
 
   def load_xml_db(self, cache_path=None):
@@ -448,16 +780,41 @@ class Lutron(object):
           loaded_from = 'cache'
       except Exception:
         pass
+
     if not loaded_from:
-      import urllib.request
-      url = 'http://' + self._host + '/DbXmlInfo.xml'
-      with urllib.request.urlopen(url) as xmlfile:
-        xml_db = xmlfile.read()
-        loaded_from = 'repeater'
+      try:
+        _LOGGER.debug("Trying FTP for XML DB")
+        import ftplib
+        with ftplib.FTP(self._host, "lutron", "lutron") as ftp:
+          ftp.set_debuglevel(2)
+          ftp.set_pasv(0)
+          ftp.login()
+          with open(cache_path+".zip", 'wb') as cached_file:
+             ftp.cwd('proc0')
+             ftp.retrbinary("RETR fullxml.dat", cached_file.write)
+             loaded_from = 'cache'
+             controllerType = "HWI"
+
+        import zipfile
+        with zipfile.ZipFile(cache_path+".zip") as myzip:
+           with myzip.open("fulldata.dat") as myfile:
+              xml_db = myfile.read()
+      except Exception as e:
+        _LOGGER.debug("FTP failed,trying HTTP for XML DB")
+        import urllib.request
+        url = 'http://' + self._host + '/DbXmlInfo.xml'
+        with urllib.request.urlopen(url) as xmlfile:
+          xml_db = xmlfile.read()
+          loaded_from = 'repeater'
+          controllerType = "QS"
 
     _LOGGER.info("Loaded xml db from %s" % loaded_from)
+    self._conn.setControllerType(controllerType)
 
-    parser = LutronXmlDbParser(lutron=self, xml_db_str=xml_db)
+    if controllerType == "HWI":
+      parser = HWIXmlDbParser(lutron=self, xml_db_str=xml_db)
+    else:
+      parser = QSXmlDbParser(lutron=self, xml_db_str=xml_db)
     assert(parser.parse())     # throw our own exception
     self._areas = parser.areas
     self._name = parser.project_name
@@ -531,16 +888,22 @@ class LutronEntity(object):
   """Base class for all the Lutron objects we'd like to manage. Just holds basic
   common info we'd rather not manage repeatedly."""
 
-  def __init__(self, lutron, name):
+  def __init__(self, lutron, name, address=None):
     """Initializes the base class with common, basic data."""
     self._lutron = lutron
     self._name = name
     self._subscribers = []
+    self._address=address
 
   @property
   def name(self):
     """Returns the entity name (e.g. Pendant)."""
     return self._name
+
+  @property
+  def address(self):
+    """Returns the address of the object. Addresses exist in legacy HWI"""
+    return self._address
 
   def _dispatch_event(self, event: LutronEvent, params: Dict):
     """Dispatches the specified event to all the subscribers."""
@@ -586,12 +949,16 @@ class Output(LutronEntity):
     """
     LEVEL_CHANGED = 1
 
-  def __init__(self, lutron, name, watts, output_type, integration_id):
+  def __init__(self, lutron, name, watts, output_type, integration_id, address=None):
     """Initializes the Output."""
-    super(Output, self).__init__(lutron, name)
+    super(Output, self).__init__(lutron, name, address), 
     self._watts = watts
     self._output_type = output_type
-    self._level = 0.0
+    # set the level to something invalid to allow a just started system to send a command which
+    # can set the level to 0. Otherwise the default value of level=0 will cause the short-circuit
+    # check of the new level being the same as the old to trigger when hit with a request for
+    # new level of 0
+    self._level = -1.0
     self._query_waiters = _RequestHelper()
     self._integration_id = integration_id
 
@@ -599,13 +966,13 @@ class Output(LutronEntity):
 
   def __str__(self):
     """Returns a pretty-printed string for this object."""
-    return 'Output name: "%s" watts: %d type: "%s" id: %d' % (
-        self._name, self._watts, self._output_type, self._integration_id)
+    return 'Output name: "%s," watts: %d, type: "%s", id: %s, address: %s, level: %f' % (
+        self._name, self._watts, self._output_type, self._integration_id, self._address, self._level)
 
   def __repr__(self):
     """Returns a stringified representation of this object."""
     return str({'name': self._name, 'watts': self._watts,
-                'type': self._output_type, 'id': self._integration_id})
+                'type': self._output_type, 'id': self._integration_id, 'address': self._address, 'level': self.level})
 
   @property
   def id(self):
@@ -614,12 +981,12 @@ class Output(LutronEntity):
 
   def handle_update(self, args):
     """Handles an event update for this object, e.g. dimmer level change."""
-    _LOGGER.debug("handle_update %d -- %s" % (self._integration_id, args))
+    _LOGGER.debug("handle_update %s -- %s" % (self._integration_id, args))
     state = int(args[0])
     if state != Output._ACTION_ZONE_LEVEL:
       return False
-    level = float(args[1])
-    _LOGGER.debug("Updating %d(%s): s=%d l=%f" % (
+    level = float(args[1].strip())
+    _LOGGER.debug("Updating %s(%s): s=%d l=%f" % (
         self._integration_id, self._name, state, level))
     self._level = level
     self._query_waiters.notify()
@@ -731,8 +1098,8 @@ class Button(KeypadComponent):
 
   def __str__(self):
     """Pretty printed string value of the Button object."""
-    return 'Button name: "%s" num: %d type: "%s" direction: "%s"' % (
-        self.name, self.number, self._button_type, self._direction)
+    return 'Button name: "%s", num: %d, type: "%s"' % (
+        self.name, self.number, self._button_type)
 
   def __repr__(self):
     """String representation of the Button object."""
@@ -787,7 +1154,7 @@ class Led(KeypadComponent):
 
   def __str__(self):
     """Pretty printed string value of the Led object."""
-    return 'LED keypad: "%s" name: "%s" num: %d component_num: %d"' % (
+    return 'LED keypad: "%s", name: "%s", num: %d, component_num: %d"' % (
         self._keypad.name, self.name, self.number, self.component_number)
 
   def __repr__(self):
@@ -849,9 +1216,9 @@ class Keypad(LutronEntity):
   """
   _CMD_TYPE = 'DEVICE'
 
-  def __init__(self, lutron, name, keypad_type, location, integration_id):
+  def __init__(self, lutron, name, keypad_type, location, integration_id, address=None):
     """Initializes the Keypad object."""
-    super(Keypad, self).__init__(lutron, name)
+    super(Keypad, self).__init__(lutron, name, address)
     self._buttons = []
     self._leds = []
     self._components = {}
@@ -913,6 +1280,13 @@ class Keypad(LutronEntity):
       return self._components[component].handle_update(action, params)
     return False
 
+  def __str__(self):
+    """Returns a pretty-printed string for this object."""
+    return 'Keypad name: "%s", location: %s, id: %s, type: %s, address: %s\n\t\t%s\n\t\t%s' % (
+        self._name, self._location, self._integration_id, self._type, self._address,
+        "\n\t\t".join([str(o) for o in self._buttons]),
+        "\n\t\t".join([str(o) for o in self._leds])
+      )
 
 class PowerSource(Enum):
   """Enum values representing power source, reported by queries to
@@ -975,7 +1349,7 @@ class MotionSensor(LutronEntity):
 
   def __str__(self):
     """Returns a pretty-printed string for this object."""
-    return 'MotionSensor {} Id: {} Battery: {} Power: {}'.format(
+    return 'MotionSensor {}, Id: {}, Battery: {}, Power: {}'.format(
         self.name, self.id, self.battery_status, self.power_source)
 
   def __repr__(self):
@@ -1095,7 +1469,6 @@ class OccupancyGroup(LutronEntity):
     return self._lutron.send(Lutron.OP_QUERY, OccupancyGroup._CMD_TYPE, self._integration_id,
                              OccupancyGroup._ACTION_STATE)
 
-
   def handle_update(self, args):
     """Handles an event update for this object, e.g. occupancy state change."""
     action = int(args[0])
@@ -1138,6 +1511,20 @@ class Area(object):
     self._sensors.append(sensor)
     if not self._occupancy_group:
       self._occupancy_group = OccupancyGroup(self._lutron, self)
+
+  def __str__(self):
+    """Returns a pretty-printed string for this object."""
+    return 'Area name: "%s", occupancy_group_id: %s, id: %d\n\t%s\n\t%s' % (
+        self._name, self._occupancy_group_id, self._integration_id,
+        "\n\t".join([str(o) for o in self._outputs]),
+        "\n\t".join([str(o) for o in self._keypads])
+      )
+
+  def __repr__(self):
+    """Returns a stringified representation of this object."""
+    return str({'name': self._name,
+                'occupancy_group_id': self._occupancy_group_id, 'id': self._integration_id,
+                'outputs': self._outputs, 'keypads': self._keypads})
 
   @property
   def name(self):
