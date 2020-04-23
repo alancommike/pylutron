@@ -31,6 +31,104 @@ class Processor(object):
   USER_PROMPT = b'login: '
   PW_PROMPT = b'password: '
 
+  def __init__(self):
+    """ Initialize """
+    self._need_single_login = False              # if login then password or login,password
+    self._processor = self.RA2                   # processor type, see class constants
+    self._cmd_index = 0                          # index into cmd table
+    self._prompt = b'GNET'                       # prompt to look for when logged in
+    self._ids = {}                               # dict of ids to hold id -> obj mappings
+
+  @property
+  def processor_type(self):
+    return self._processor
+
+  def obj(self, obj_id, cmd_type=None):
+      """ return the obj from an id. If the cmd_type isn't passed in, it'll look through all
+      cmd types for the id"""
+      obj_id = obj_id.strip()
+      if cmd_type:
+        return self._ids[cmd_type][obj_id]
+      else:
+        for cmd_dict in self._ids:
+            if obj_id in cmd_dict:
+                return cmd_dict[obj_id]
+
+  @property
+  def need_single_login(self):
+    return self._need_single_login
+
+  @property
+  def prompt(self):
+    return self._prompt
+
+  @property
+  def cmd_types(self):
+     """ return all the cmd_types available"""
+     return self._ids.keys()
+
+  def register_id(self, cmd_type, obj):
+    """Handles the management of ids. HWI processors use addresses whereas the newer
+    processors use ids. This abstracts out the differences."""
+    self._register_id(cmd_type, obj.id, obj)
+
+  def _register_id(self, cmd_type, obj_id, obj):
+    ids = self._ids.setdefault(cmd_type, {})
+
+    if obj_id in ids:
+      raise IntegrationIdExistsError
+    self._ids[cmd_type][obj_id] = obj
+    _LOGGER.debug("Registered %s of type %s" % (obj_id, cmd_type))
+
+  def cmd(self, command_str):
+    """ Take in a command and translate if needed. The native protocol is QS,
+    so if the command is inHWI format, convert to QS. All commands are returned as
+    a list of one or more commands."""
+
+    return [command_str]
+
+  def connect(self, telnet, user, password):
+    """Connect to the processor. HWI requires login,password whereas QA is a normal
+    login followed by password"""
+
+    telnet.read_until(self.USER_PROMPT, timeout=3)
+    if self._need_single_login:
+      login_string="%s,%s".encode('ascii') % (user, password)
+      telnet.write(login_string + b'\r\n')
+    else:
+      telnet.write(user + b'\r\n')
+      telnet.read_until(self.PW_PROMPT, timeout=3)
+      telnet.write(password + b'\r\n')
+
+  def parser(self, lutron, xml_db_str):
+      return QSXmlDbParser(lutron, xml_db_str)
+
+  def initialize(self, connection):
+      pass
+
+class QSProcessor(Processor):
+  """ Processor for QS systems """
+
+  def __init__(self):
+    super(QSProcessor, self).__init__()
+
+    self._need_single_login = False              # if login then password or login,password
+    self._processor = self.QS                    # processor type, see class constants
+    self._prompt = b'QNET> '                       # prompt to look for when logged in
+    self._format = self.CommandFormatter(self)   # internal string formatter
+
+class RA2Processor(QSProcessor):
+  """ Processor for RA2 systems """
+
+  def __init__(self):
+    super(RA2Processor, self).__init__()
+    self._processor = self.RA2                    # processor type, see class constants
+    self._prompt = b'GNET>'                       # prompt to look for when logged in
+
+class HWIProcessor(Processor):
+  """ Encapsulates the specific communication protocols associated with a Lutron Processor. The base comms protocol is RA2/QS,
+    when talking to an HWI processor, there is a protocol conversion."""
+
   class CommandFormatter(string.Formatter):
     """ Helper class to format strings for conversions. Adds to the Formatter spec:
           - Added a psuedo arg_name 'all'. An arg_name such as {all} will return all the arguments
@@ -70,12 +168,12 @@ class Processor(object):
      With the structure of the existing code that's difficult. So it can initialize
      without args and then later have the processor type set."""
 
-    self._need_single_login = False              # if login then password or login,password
-    self._processor = self.RA2                   # processor type, see class constants
-    self._cmd_index = 0                          # index into cmd table
-    self._prompt = b'GNET'                       # prompt to look for when logged in
+    super(HWIProcessor, self).__init__()
+    self._need_single_login = True               # need login,password
+    self._cmd_index = 1
+    self._processor = self.HWI                   # processor type, see class constants
+    self._prompt = b'LNET> '                     # prompt to look for when logged in
     self._format = self.CommandFormatter(self)   # internal string formatter
-    self._ids = {}                               # dict of ids to hold id -> obj mappings
 
       # rewrite rules. matches on the first argument.
       #
@@ -99,34 +197,6 @@ class Processor(object):
                    'DL' : [[], ["%sOUTPUT, {1}, %s, {2}" % (Lutron.OP_RESPONSE, Output._ACTION_ZONE_LEVEL)]]
                     }
 
-  @property
-  def processor_type(self):
-    return self._processor
-
-  def obj(self, obj_id, cmd_type=None):
-      """ return the obj from an id. If the cmd_type isn't passed in, it'll look through all
-      cmd types for the id"""
-      obj_id = obj_id.strip()
-      if cmd_type:
-        return self._ids[cmd_type][obj_id]
-      else:
-        for cmd_dict in self._ids:
-            if obj_id in cmd_dict:
-                return cmd_dict[obj_id]
-
-  @property
-  def need_single_login(self):
-    return self._need_single_login
-
-  @property
-  def prompt(self):
-    return self._prompt
-
-  @property
-  def cmd_types(self):
-     """ return all the cmd_types available"""
-     return self._ids.keys()
-
   def canonicalize_addr(self, addr):
     """ Turns a HWI address into the canonical format. i.e., square brackets, colon separated,
       and two digits.
@@ -141,34 +211,8 @@ class Processor(object):
   def register_id(self, cmd_type, obj):
     """Handles the management of ids. HWI processors use addresses whereas the newer
     processors use ids. This abstracts out the differences."""
-    ids = self._ids.setdefault(cmd_type, {})
 
-    if self.processor_type == Processor.HWI:
-      obj_id = self.canonicalize_addr(obj.address)
-    else:
-      obj_id = obj.id
-
-    if obj_id in ids:
-      raise IntegrationIdExistsError
-    self._ids[cmd_type][obj_id] = obj
-    _LOGGER.debug("Registered %s of type %s" % (obj_id, cmd_type))
-
-  def setProcessor(self, processor_type):
-    if processor_type == "HWI":
-      self._processor = self.HWI
-      self._need_single_login = True
-      self._cmd_index = 1
-      self._prompt = b'LNET> '
-    elif processor_type == "QS":
-      self._processor = self.QS
-      self._cmd_index = 0
-      self._prompt = b'QNET> '
-    else:
-      # at this point, set the processor type to RA2 independent of what was passed in
-      _LOGGER.info("Unknown processor \"%s\", defaulting to RA2" % processor_type)
-      self._processor = self.RA2
-      self._cmd_index = 0
-      self._prompt = b'GNET>'
+    self._register_id(cmd_type, self.canonicalize_addr(obj.address), obj)
 
   def cmd(self, command_str):
     """ Take in a command and translate if needed. The native protocol is QS,
@@ -212,19 +256,17 @@ class Processor(object):
     except:
       return [command_str]
 
+  def parser(self, lutron, xml_db_str):
+      return HWIXmlDbParser(lutron, xml_db_str)
 
-  def connect(self, telnet, user, password):
-    """Connect to the processor. HWI requires login,password whereas QA is a normal
-    login followed by password"""
-
-    telnet.read_until(self.USER_PROMPT, timeout=3)
-    if self._need_single_login:
-      login_string="%s,%s".encode('ascii') % (user, password)
-      telnet.write(login_string + b'\r\n')
-    else:
-      telnet.write(user + b'\r\n')
-      telnet.read_until(self.PW_PROMPT, timeout=3)
-      telnet.write(password + b'\r\n')
+  def initialize(self, connection):
+    connection._send_locked("PROMPT")
+    connection._send_locked("MON_OFF")
+    connection._send_locked("BTN_MON")
+    connection._send_locked("LED_MON")
+    connection._send_locked("ZONE_MON")
+    connection._send_locked("OCCP_MON")
+    connection._send_locked("SCENE_MON")
 
 class LutronException(Exception):
   """Top level module exception."""
@@ -263,7 +305,7 @@ class LutronConnection(threading.Thread):
     self._connect_cond = threading.Condition(lock=self._lock)
     self._recv_cb = recv_callback
     self._done = False
-    self._processor = Processor()
+    self._processor = None
 
     self.setDaemon(True)
 
@@ -271,8 +313,8 @@ class LutronConnection(threading.Thread):
   def processor(self):
     return self._processor
 
-  def setControllerType(self, processor_type):
-    self._processor.setProcessor(processor_type)
+  def setControllerType(self, processor):
+    self._processor = processor
 
   def connect(self):
     """Connects to the lutron controller."""
@@ -331,17 +373,10 @@ class LutronConnection(threading.Thread):
 
     self._processor.connect(self._telnet, self._user, self._password)
 
-
     _LOGGER.debug("Logged in, waiting for prompt")
     self._telnet.read_until(self._processor.prompt, timeout=3)
 
-    self._send_locked("PROMPT")
-    self._send_locked("MON_OFF")
-    self._send_locked("BTN_MON")
-    self._send_locked("LED_MON")
-    self._send_locked("ZONE_MON")
-    self._send_locked("OCCP_MON")
-    self._send_locked("SCENE_MON")
+    self._processor.initialize(self)
 
   def _disconnect_locked(self):
     """Closes the current connection. Assume self._lock is held."""
@@ -773,6 +808,7 @@ class Lutron(object):
 
     xml_db = None
     loaded_from = None
+    controllerType = None
     if cache_path:
       try:
         with open(cache_path, 'rb') as f:
@@ -793,7 +829,7 @@ class Lutron(object):
              ftp.cwd('proc0')
              ftp.retrbinary("RETR fullxml.dat", cached_file.write)
              loaded_from = 'cache'
-             controllerType = "HWI"
+             controllerType = HWIProcessor()
 
         import zipfile
         with zipfile.ZipFile(cache_path+".zip") as myzip:
@@ -806,15 +842,13 @@ class Lutron(object):
         with urllib.request.urlopen(url) as xmlfile:
           xml_db = xmlfile.read()
           loaded_from = 'repeater'
-          controllerType = "QS"
+          controllerType = QSProcessor()
 
     _LOGGER.info("Loaded xml db from %s" % loaded_from)
     self._conn.setControllerType(controllerType)
 
-    if controllerType == "HWI":
-      parser = HWIXmlDbParser(lutron=self, xml_db_str=xml_db)
-    else:
-      parser = QSXmlDbParser(lutron=self, xml_db_str=xml_db)
+    parser = self._conn.processor.parser(lutron=self, xml_db_str=xml_db)
+
     assert(parser.parse())     # throw our own exception
     self._areas = parser.areas
     self._name = parser.project_name
