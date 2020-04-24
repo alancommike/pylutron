@@ -268,6 +268,17 @@ class HWIProcessor(Processor):
     connection._send_locked("OCCP_MON")
     connection._send_locked("SCENE_MON")
 
+# We brute force exception handling in a number of areas to ensure
+# connections can be recovered
+_EXPECTED_NETWORK_EXCEPTIONS = (
+  BrokenPipeError,
+  # OSError: [Errno 101] Network unreachable
+  OSError,
+  EOFError,
+  TimeoutError,
+  socket.timeout,
+)
+
 class LutronException(Exception):
   """Top level module exception."""
   pass
@@ -338,7 +349,8 @@ class LutronConnection(threading.Thread):
       for cooked_cmd in cooked_cmds:
         _LOGGER.debug("Sending Command: %s -> %s" % (cmd, cooked_cmd))
         self._telnet.write(cooked_cmd.encode('ascii') + b'\r\n')
-    except (BrokenPipeError, TimeoutError, OSError, AttributeError):
+    except _EXPECTED_NETWORK_EXCEPTIONS:
+      _LOGGER.exception(f"Error sending {cmd}")
       self._disconnect_locked()
 
   def send(self, cmd):
@@ -348,7 +360,7 @@ class LutronConnection(threading.Thread):
     """
     with self._lock:
       if not self._connected:
-        _LOGGER.debug("Ignoring send of '%s' beause we are disconnected." % cmd)
+        _LOGGER.debug("Ignoring send of '%s' because we are disconnected." % cmd)
         return
       self._send_locked(cmd)
 
@@ -362,14 +374,17 @@ class LutronConnection(threading.Thread):
     try:
       sock = self._telnet.get_socket()
       sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-      # Send keepalive probes after 60 seconds of inactivity
-#      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+      # Some operating systems may not include TCP_KEEPIDLE (macOS, variants of Windows)
+      if hasattr(socket, 'TCP_KEEPIDLE'):
+        # Send keepalive probes after 60 seconds of inactivity
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+
       # Wait 10 seconds for an ACK
-#      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
       # Send 3 probes before we give up
-#     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
     except OSError:
-      pass
+      _LOGGER.exception('error configuring socket')
 
     self._processor.connect(self._telnet, self._user, self._password)
 
@@ -380,10 +395,12 @@ class LutronConnection(threading.Thread):
 
   def _disconnect_locked(self):
     """Closes the current connection. Assume self._lock is held."""
+    was_connected = self._connected
     self._connected = False
     self._connect_cond.notify_all()
     self._telnet = None
-    _LOGGER.warning("Disconnected")
+    if was_connected:
+      _LOGGER.warning("Disconnected")
 
   def _maybe_reconnect(self):
     """Reconnects to the controller if we have been previously disconnected."""
@@ -414,12 +431,15 @@ class LutronConnection(threading.Thread):
           line = t.read_until(b"\n", timeout=3)
         else:
           raise EOFError('Telnet object already torn down')
-      except (EOFError, TimeoutError, socket.timeout, AttributeError):
+      except _EXPECTED_NETWORK_EXCEPTIONS:
+        _LOGGER.exception("Uncaught exception")
         try:
           # if it didn't connect, wait a bit to see if the transient error cleared up.
           time.sleep(1)
           self._lock.acquire()
           self._disconnect_locked()
+          # don't spam reconnect
+          time.sleep(1)
           continue
         finally:
           self._lock.release()
@@ -605,6 +625,7 @@ class QSXmlDbParser(LutronXmlDbParser):
         if device_xml.tag != 'Device':
           continue
         if device_xml.get('DeviceType') in (
+            'HWI_SEETOUCH_KEYPAD',
             'SEETOUCH_KEYPAD',
             'SEETOUCH_TABLETOP_KEYPAD',
             'PICO_KEYPAD',
@@ -1149,6 +1170,16 @@ class Button(KeypadComponent):
     """Triggers a simulated button press to the Keypad."""
     self._lutron.send(Lutron.OP_EXECUTE, Keypad._CMD_TYPE, self._keypad.id,
                       self.component_number, Button._ACTION_PRESS)
+
+  def release(self):
+    """Triggers a simulated button release to the Keypad."""
+    self._lutron.send(Lutron.OP_EXECUTE, Keypad._CMD_TYPE, self._keypad.id,
+                      self.component_number, Button._ACTION_RELEASE)
+
+  def tap(self):
+    """Triggers a simulated button tap to the Keypad."""
+    self.press()
+    self.release()
 
   def handle_update(self, action, params):
     """Handle the specified action on this component."""
