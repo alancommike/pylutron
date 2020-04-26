@@ -19,6 +19,17 @@ from typing import Any, Callable, Dict, Type
 
 _LOGGER = logging.getLogger(__name__)
 
+# We brute force exception handling in a number of areas to ensure
+# connections can be recovered
+_EXPECTED_NETWORK_EXCEPTIONS = (
+  BrokenPipeError,
+  # OSError: [Errno 101] Network unreachable
+  OSError,
+  EOFError,
+  TimeoutError,
+  socket.timeout,
+)
+
 class Processor(object):
   """ Encapsulates the specific communication protocols associated with a Lutron Processor. The base comms protocol is RA2/QS,
     when talking to an HWI processor, there is a protocol conversion."""
@@ -33,7 +44,6 @@ class Processor(object):
 
   def __init__(self):
     """ Initialize """
-    self._need_single_login = False              # if login then password or login,password
     self._processor = self.RA2                   # processor type, see class constants
     self._cmd_index = 0                          # index into cmd table
     self._prompt = b'GNET'                       # prompt to look for when logged in
@@ -53,10 +63,6 @@ class Processor(object):
         for cmd_dict in self._ids:
             if obj_id in cmd_dict:
                 return cmd_dict[obj_id]
-
-  @property
-  def need_single_login(self):
-    return self._need_single_login
 
   @property
   def prompt(self):
@@ -88,22 +94,20 @@ class Processor(object):
     return [command_str]
 
   def connect(self, telnet, user, password):
-    """Connect to the processor. HWI requires login,password whereas QA is a normal
-    login followed by password"""
+    """Connect to the processor. """
 
+    # Wait for the login prompt, send the username. Wait for the password. 
     telnet.read_until(self.USER_PROMPT, timeout=3)
-    if self._need_single_login:
-      login_string="%s,%s".encode('ascii') % (user, password)
-      telnet.write(login_string + b'\r\n')
-    else:
-      telnet.write(user + b'\r\n')
-      telnet.read_until(self.PW_PROMPT, timeout=3)
-      telnet.write(password + b'\r\n')
+    telnet.write(user + b'\r\n')
+    telnet.read_until(self.PW_PROMPT, timeout=3)
+    telnet.write(password + b'\r\n')
 
   def parser(self, lutron, xml_db_str):
-      return QSXmlDbParser(lutron, xml_db_str)
+      """ Returns a Parser object to parse the database for this processor. """
+      pass
 
   def initialize(self, connection):
+      """ Called after a successful connection to setup any additional configuration. """
       pass
 
 class QSProcessor(Processor):
@@ -114,8 +118,12 @@ class QSProcessor(Processor):
 
     self._need_single_login = False              # if login then password or login,password
     self._processor = self.QS                    # processor type, see class constants
-    self._prompt = b'QNET> '                       # prompt to look for when logged in
+    self._prompt = b'QNET>'                      # prompt to look for when logged in
     self._format = self.CommandFormatter(self)   # internal string formatter
+
+  def parser(self, lutron, xml_db_str):
+      """ Parse QS/RA2 database. """
+      return QSXmlDbParser(lutron, xml_db_str)
 
 class RA2Processor(QSProcessor):
   """ Processor for RA2 systems """
@@ -172,7 +180,7 @@ class HWIProcessor(Processor):
     self._need_single_login = True               # need login,password
     self._cmd_index = 1
     self._processor = self.HWI                   # processor type, see class constants
-    self._prompt = b'LNET> '                     # prompt to look for when logged in
+    self._prompt = b'LNET>'                     # prompt to look for when logged in
     self._format = self.CommandFormatter(self)   # internal string formatter
 
       # rewrite rules. matches on the first argument.
@@ -223,6 +231,10 @@ class HWIProcessor(Processor):
     if command_str == '':
         return [command_str]
 
+    # ignore the return of the prompt
+    if command_str == self._prompt:
+        return []
+
     #
     # Find the command name for lookup. If there's nothing that looks like a command, deem it
     # a passthrough and return the original string. All commands need not be implemented in the
@@ -256,28 +268,29 @@ class HWIProcessor(Processor):
     except:
       return [command_str]
 
+  def connect(self, telnet, user, password):
+    """Connect to the processor. HWI requires login,password whereas QS/RA2 is a normal
+    login followed by password"""
+
+    # Wait for the login prompt, send the username,password and then turn on the prompt.
+    telnet.read_until(self.USER_PROMPT, timeout=3)
+    login_string="%s,%s".encode('ascii') % (user, password)
+    telnet.write(login_string + b'\r\n')
+
+    # turn on prompting, this is used to find the end of the returned line
+    telnet.write("PROMPTON".encode('ascii') + b'\r\n')
+
   def parser(self, lutron, xml_db_str):
       return HWIXmlDbParser(lutron, xml_db_str)
 
   def initialize(self, connection):
-    connection._send_locked("PROMPT")
+    """ Setup monitoring """
     connection._send_locked("MON_OFF")
     connection._send_locked("BTN_MON")
     connection._send_locked("LED_MON")
     connection._send_locked("ZONE_MON")
     connection._send_locked("OCCP_MON")
     connection._send_locked("SCENE_MON")
-
-# We brute force exception handling in a number of areas to ensure
-# connections can be recovered
-_EXPECTED_NETWORK_EXCEPTIONS = (
-  BrokenPipeError,
-  # OSError: [Errno 101] Network unreachable
-  OSError,
-  EOFError,
-  TimeoutError,
-  socket.timeout,
-)
 
 class LutronException(Exception):
   """Top level module exception."""
@@ -389,7 +402,16 @@ class LutronConnection(threading.Thread):
     self._processor.connect(self._telnet, self._user, self._password)
 
     _LOGGER.debug("Logged in, waiting for prompt")
-    self._telnet.read_until(self._processor.prompt, timeout=3)
+    try:
+       prompt = self._telnet.read_until(self._processor.prompt, timeout=3)
+       if not self._processor.prompt in prompt:
+          _LOGGER.warning("Bad Password (%s). Disconnecting." % prompt)
+          self._telnet = None
+          return
+    except EOFError:
+        _LOGGER.exception("Logged out while waiting for prompt")
+        self._telnet = None
+        return
 
     self._processor.initialize(self)
 
@@ -407,11 +429,13 @@ class LutronConnection(threading.Thread):
     with self._lock:
       if not self._connected:
         _LOGGER.info("Connecting")
-        # This can throw an exception, but we'll catch it in run()
+        # Make sure that it was able to log in. If the telnet connection got torn
+        # down during login, it's not a successful connection
         self._do_login_locked()
-        self._connected = True
+        if self._telnet:
+           self._connected = True
+           _LOGGER.info("Connected")
         self._connect_cond.notify_all()
-        _LOGGER.info("Connected")
 
   def _main_loop(self):
     """Main body of the the thread function.
@@ -428,7 +452,11 @@ class LutronConnection(threading.Thread):
         # code runs synchronously in this loop).
         t = self._telnet
         if t is not None:
-          line = t.read_until(b"\n", timeout=3)
+          try: 
+             line = t.read_until(b"\n", timeout=3)
+          except EOFError:
+              self._connected = False
+              _LOGGER.exception('Connection closed while reading next line.')
         else:
           raise EOFError('Telnet object already torn down')
       except _EXPECTED_NETWORK_EXCEPTIONS:
@@ -788,7 +816,7 @@ class Lutron(object):
 
   def _recv(self, line):
     """Invoked by the connection manager to process incoming data."""
-    if line == '':
+    if line == '' or self._conn._processor.prompt.decode('utf-8') in line:
       return
     _LOGGER.debug("Received: %s" % line)
     # Only handle query response messages, which are also sent on remote status
