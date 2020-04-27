@@ -19,23 +19,23 @@ CLI Example
 -----------
 
 Interactive CLI:
-   ./lutron_cli.py -c mycontroller -u myuser -p mypassword
-   pylutron> help
-   pylutron> list
-   pylutron> light my_light on 75
-   pylutron> list keypads -f
-   pylutron> press my_k m
+    ./lutron_cli.py -c mycontroller -u myuser -p mypassword
+    pylutron> help
+    pylutron> list
+    pylutron> light my_light on 75
+    pylutron> list keypads -f
+    pylutron> press my_k m
 
 Non-interactive Scripting:
-   ./lutron_cli.py -c mycontroller -u myuser -p mypassword light my_light on 75
+    ./lutron_cli.py -c mycontroller -u myuser -p mypassword light my_light on 75
 
 All commands take a filter, which is a case insensitive regex filter. Without
 wildcards, the filter matches at the start of the string. For example,
-   pylutron> list areas a
+    pylutron> list areas a
 
 Will match all areas that start with 'a'. To match all areas with an 'a', 
 the regex will look like:
-   pylutron> list areas .*a.*
+    pylutron> list areas .*a.*
 
 Most commands have a -h to get per command help. Most of the list commands
 have a -f to see more details. This is especially helpful with Keypads
