@@ -435,7 +435,7 @@ class LutronConnection(threading.Thread):
         if self._telnet:
            self._connected = True
            _LOGGER.info("Connected")
-        self._connect_cond.notify_all()
+           self._connect_cond.notify_all()
 
   def _main_loop(self):
     """Main body of the the thread function.
@@ -785,6 +785,10 @@ class Lutron(object):
   def processor_type(self):
     return self._conn.processor.processor_type
 
+  @property
+  def connected(self):
+      return self._conn._connected
+
   def subscribe(self, obj, handler):
     """Subscribes to status updates of the requested object.
 
@@ -871,7 +875,8 @@ class Lutron(object):
         _LOGGER.debug("Trying FTP for XML DB")
         import ftplib
         with ftplib.FTP(self._host, "lutron", "lutron") as ftp:
-          ftp.set_debuglevel(2)
+          if logging.getLogger().level == logging.DEBUG:
+             ftp.set_debuglevel(2)
           ftp.set_pasv(0)
           ftp.login()
           with open(cache_path+".zip", 'wb') as cached_file:

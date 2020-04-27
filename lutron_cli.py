@@ -7,7 +7,6 @@ import argparse
 import re
 import logging
 
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
 
 # create the top-level parser for the alternate command
@@ -17,11 +16,18 @@ list_subparsers = list_parser.add_subparsers(title='subcommands')
 light_parser = argparse.ArgumentParser()
 button_parser = argparse.ArgumentParser()
 
+default_controller = "192.168.111.123"
+default_user = "ipad"
+default_password = "ipad"
 
 class lutron(cmd2.Cmd):
-    def __init__(self):
+    def __init__(self, controller, user, password):
         cmd2.Cmd.__init__(self)
-        self._l = pylutron.Lutron("192.168.111.123", "ipad", "ipad")
+        self.prompt = "pylutron> "
+        self.self_in_py = True
+        self.default_category = "Python cmd2 built-ins"
+        
+        self._l = pylutron.Lutron(controller, user, password)
         self._db = self._l.load_xml_db("/tmp/cached_xml_db")
 
         self._l.connect()
@@ -30,11 +36,11 @@ class lutron(cmd2.Cmd):
         # default lists only the name, optional --full argument lists all attributes
         # keypads can take optional --button argument to list the buttons associated with the keypad
         # all devices can take an optional regex filter
-        devices = [{"cmd":"areas",    "func":self.do_list_areas},
-                   {"cmd":"keypads",  "func":self.do_list_keypads, "args":('-b', '--button')},
-                   {"cmd":"switches", "func":self.do_list_switches},
-                   {"cmd":"lights",   "func":self.do_list_lights},
-                   {"cmd":"fans",     "func":self.do_list_fans} ]
+        devices = [{"cmd":"areas",    "func":self._list_areas},
+                   {"cmd":"keypads",  "func":self._list_keypads, "args":('-b', '--button')},
+                   {"cmd":"switches", "func":self._list_switches},
+                   {"cmd":"lights",   "func":self._list_lights},
+                   {"cmd":"fans",     "func":self._list_fans} ]
         for d in devices:
             subparser = list_subparsers.add_parser(d["cmd"])
             subparser.set_defaults(func=d["func"])
@@ -47,15 +53,17 @@ class lutron(cmd2.Cmd):
         light_parser.add_argument('filter', nargs='?', const='.*', default=None)
         lsp = light_parser.add_subparsers()
         sp = lsp.add_parser("on")
-        sp.set_defaults(func=self.do_lights_on)
+        sp.set_defaults(func=self._lights_on)
         sp.add_argument('level', nargs='?', default="100")
 
         sp = lsp.add_parser("off")
-        sp.set_defaults(func=self.do_lights_off)
+        sp.set_defaults(func=self._lights_off)
 
         button_parser.add_argument('keypad')
         button_parser.add_argument('button')
 
+    
+    @cmd2.with_category("PyLutron")
     @cmd2.with_argparser(list_parser)
     def do_list(self, args):
         """List all the devices in the controller"""
@@ -73,13 +81,14 @@ class lutron(cmd2.Cmd):
         
         self.poutput("\n".join([str(a) for a in self._l.areas]))
 
+    @cmd2.with_category("PyLutron")
     @cmd2.with_argparser(light_parser)
     def do_lights(self, args):
         """Turn a light on/off"""
 
         # find the lights requested by the filter
         args.full=False
-        lights = self.do_list_lights(args)
+        lights = self._list_lights(args)
 
         # make sure there's at least one
         if not lights:
@@ -96,14 +105,15 @@ class lutron(cmd2.Cmd):
         for (light, name) in lights:
             self.poutput("name: {}, level: {}".format(name, light.level))
 
-    def do_lights_on(self, light, args):
+    def _lights_on(self, light, args):
         """Turn a light on to a specific level"""
         light.level = float(args.level)
 
-    def do_lights_off(self, light, args):
+    def _lights_off(self, light, args):
         """Turn a light off, i.e. level = 0"""
         light.level = 0.0
 
+    @cmd2.with_category("PyLutron")
     @cmd2.with_argparser(button_parser)
     def do_press(self, args):
         """Press a button"""
@@ -111,7 +121,7 @@ class lutron(cmd2.Cmd):
         # find the buttons requested by the filter
         args.full=False
         args.filter=args.keypad
-        keypads = self.do_list_keypads(args)
+        keypads = self._list_keypads(args)
 
         # make sure there's at least one
         if not keypads:
@@ -123,7 +133,7 @@ class lutron(cmd2.Cmd):
             for b in buttons:
                 b.press()
             
-    def do_list_areas(self, args):
+    def _list_areas(self, args):
         """List the areas in the controller"""
         format_str = "{0!s}" if args.full else "{0.name}"
 
@@ -165,7 +175,7 @@ class lutron(cmd2.Cmd):
 
         return buttons
 
-    def do_list_keypads(self, args):
+    def _list_keypads(self, args):
         """List the areas in the controller"""
 
         if args.button:
@@ -173,18 +183,44 @@ class lutron(cmd2.Cmd):
         else:
             return self._list_helper(args, "keypads", r'KEYPAD')
 
-    def do_list_switches(self, args):
+    def _list_switches(self, args):
         """List the areas in the controller"""
         return self._list_helper(args, "keypads", r'DIMMER/SWITCH')
 
-    def do_list_lights(self, args):
+    def _list_lights(self, args):
         """List the lights in the controller"""
         return self._list_helper(args, "outputs", r'DIMMER')
 
-    def do_list_fans(self, args):
+    def _list_fans(self, args):
         """List the areas in the controller"""
         return self._list_helper(args, "outputs", r'FAN')
 
 if __name__ == '__main__':
-    app = lutron()
-    sys.exit(app.cmdloop())
+    cmdline = argparse.ArgumentParser(description="pylutron CLI")
+    cmdline.add_argument('-c', '--controller', default=default_controller)
+    cmdline.add_argument('-u', '--user', default=default_user)
+    cmdline.add_argument('-p', '--password', default=default_password)
+    cmdline.add_argument('-d', '--debug', action='store_true')
+
+    # only consume the connection args, if there are other cmd line args assume 
+    # those are commands
+    args, left = cmdline.parse_known_args()
+    sys.argv = sys.argv[:1]+left
+
+    if args.debug:
+        logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+
+    # create the lutron class
+    app = lutron(args.controller, args.user, args.password)
+
+    # Note, the connection to the processor will retry forever, so this check
+    # is a bit superflous
+    if not app._l.connected:
+        sys.exit()
+
+    # either run a command or enter the interactive loop
+    if len(sys.argv) > 1:
+       app.onecmd_plus_hooks(" ".join(sys.argv[1:]))
+    else:
+      sys.exit(app.cmdloop())
+  
