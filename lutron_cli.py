@@ -6,8 +6,12 @@ import time
 import argparse
 import re
 import logging
+import time
 
-
+# Change these to match the site
+default_controller = "192.168.111.123"
+default_user = "ipad"
+default_password = "ipad"
 
 # create the top-level parser for the alternate command
 # The alternate command doesn't provide its own help flag
@@ -16,10 +20,6 @@ list_subparsers = list_parser.add_subparsers(title='subcommands')
 light_parser = argparse.ArgumentParser()
 button_parser = argparse.ArgumentParser()
 
-default_controller = "192.168.111.123"
-default_user = "ipad"
-default_password = "ipad"
-
 class lutron(cmd2.Cmd):
     def __init__(self, controller, user, password):
         cmd2.Cmd.__init__(self)
@@ -27,8 +27,10 @@ class lutron(cmd2.Cmd):
         self.self_in_py = True
         self.default_category = "Python cmd2 built-ins"
         
+#        self._l = pylutron.Lutron(controller, user, password, pylutron.Processor.QS)
+#        self._db = self._l.load_xml_db("/tmp/cached_xml_db")
         self._l = pylutron.Lutron(controller, user, password)
-        self._db = self._l.load_xml_db("/tmp/cached_xml_db")
+        self._db = self._l.load_xml_db()
 
         self._l.connect()
 
