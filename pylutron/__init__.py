@@ -624,7 +624,7 @@ class HWIXmlDbParser(LutronXmlDbParser):
         button = Button(self._lutron, keypad,
                         name=button_xml.find('Name').text,
                         num=int(button_xml.find('Number').text),
-                        button_type=button_xml.find('Type').text,
+                        button_type=button_xml.find('Type').text.replace("Default ", ""),
                         direction='direction')
 
         return button
